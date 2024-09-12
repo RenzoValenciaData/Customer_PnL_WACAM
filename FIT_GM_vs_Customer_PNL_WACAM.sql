@@ -39,6 +39,13 @@ WITH FIT_GM_DATA_S1 AS (
       ELSE "NN"
     END AS ACCOUNT_LVL_1
     ,SUM(a.value) AS value_LCL_FIT_GM
+    ,SUM(
+      CASE
+        WHEN b.level_07_description = "Revenue Reductions" THEN -1 * a.value
+        WHEN b.level_06_description = "Cost of Goods Sold" THEN -1 * a.value
+        ELSE a.value
+      END
+    ) AS value_LCL_FIT_GM
   FROM FIT_GM_DATA_S1 a
   LEFT JOIN PRD_ACCOUNT_HIERARCHY b ON a.account_code = b.account_code
   GROUP BY 1,2,3
@@ -60,7 +67,9 @@ WITH FIT_GM_DATA_S1 AS (
 SELECT
   FIT.*
   ,PRD_FF.VALUE_LCL_PRD_FF
+  ,FIT.VALUE_LCL_FIT_GM - PRD_FF.VALUE_LCL_PRD_FF AS DIFF_FIT_vs_PRD_FF
 FROM FIT_GM_DATA_S2 FIT
 LEFT JOIN PRD_FF_TABLE PRD_FF ON fit.date = prd_ff.date
   AND fit.market = prd_ff.market
   AND fit.account_lvl_1 = prd_ff.account_lvl_1
+ORDER BY DATE DESC
