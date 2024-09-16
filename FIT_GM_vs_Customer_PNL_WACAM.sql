@@ -38,7 +38,6 @@ WITH FIT_GM_DATA_S1 AS (
       WHEN b.level_07_description = "Revenue Reductions" THEN "Gross to Net"
       ELSE "NN"
     END AS ACCOUNT_LVL_1
-    ,SUM(a.value) AS value_LCL_FIT_GM
     ,SUM(
       CASE
         WHEN b.level_07_description = "Revenue Reductions" THEN -1 * a.value
@@ -64,12 +63,30 @@ WITH FIT_GM_DATA_S1 AS (
   GROUP BY 1,2,3
 )
 
+,DEV_FF_TABLE AS (
+  SELECT 
+    DATE
+    ,MARKET
+    ,ACCOUNT_LVL_1 
+    ,SUM(Value_LCL) AS VALUE_LCL_DEV_FF
+  FROM   `dev-amer-analyt-actuals-svc-7a.amer_p_la_fin_data_hub.v_wacam_cust_pnl_detailed_ff`
+  WHERE MARKET = "COLOMBIA"
+    AND ACCOUNT_LVL_1 NOT IN ("Net Invoice Sales","Net Revenue","Gross Profit")
+    AND SCENARIO = "ACT"
+  GROUP BY 1,2,3
+)
+
 SELECT
   FIT.*
   ,PRD_FF.VALUE_LCL_PRD_FF
-  ,FIT.VALUE_LCL_FIT_GM - PRD_FF.VALUE_LCL_PRD_FF AS DIFF_FIT_vs_PRD_FF
+  ,ROUND(FIT.VALUE_LCL_FIT_GM - PRD_FF.VALUE_LCL_PRD_FF ,2) AS DIFF_FIT_vs_PRD_FF
+  ,DEV_FF.VALUE_LCL_DEV_FF
+  ,ROUND( FIT.VALUE_LCL_FIT_GM - DEV_FF.VALUE_LCL_DEV_FF ,2) AS DIFF_FIT_vs_DEV_FF
 FROM FIT_GM_DATA_S2 FIT
 LEFT JOIN PRD_FF_TABLE PRD_FF ON fit.date = prd_ff.date
   AND fit.market = prd_ff.market
   AND fit.account_lvl_1 = prd_ff.account_lvl_1
+LEFT JOIN DEV_FF_TABLE DEV_FF ON fit.date = dev_ff.date
+  AND fit.market = dev_ff.market
+  AND fit.account_lvl_1 = dev_ff.account_lvl_1
 ORDER BY DATE DESC
