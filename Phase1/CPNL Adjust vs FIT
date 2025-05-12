@@ -1,0 +1,221 @@
+CREATE OR REPLACE VIEW `dev-amer-analyt-actuals-svc-7a.amer_p_la_fin_data_hub.V_CPNL_WACAM_PHASE1_ADJUST_VS_FIT` AS (
+/*=== SOURCES TABLES - EXTRACTS FROM FIT AND CPNL AT SKU LVL ===*/
+
+WITH FIT_GM_WACAM AS (
+  SELECT 
+      CASE entity
+        WHEN 'CDBOLFS' THEN 'BOLIVIA'
+        WHEN 'CLLFS' THEN 'CHILE'
+        WHEN 'CDCOLCOM' THEN 'COLOMBIA'
+        WHEN 'ECLFS' THEN 'ECUADOR'
+        WHEN 'PELFS' THEN 'PERU'
+      END AS COUNTRY
+      ,CASE
+        WHEN account_code in ("PL212050_20","PL212050_10","PL212035_10","PL212040_10") THEN "Transportation & Warehousing"
+        WHEN account_code in ("PL211010_10_20","PL211010_20_20","PL213010_70","PL211010_30_20","PL211010_40_10","PL211010_40_30_10","PL211010_40_50","PL211097","Conversion_Other","PL211010_10_10","PL211010_20_10","PL213010_60",
+        "PL211010_30_10","PL211010_40_20_20","PL211010_40_20_10","PL211010_01","PL211064","PL213010_90_10","PL211100_10") then "Variable Cost"
+        WHEN account_code in ("PL211060","PL211062")  THEN "Write Off"
+        WHEN account_code = "PL201010_01" THEN "Gross Sales"
+        WHEN account_code = "PL202069_01" THEN "Consumer Incentives"
+        WHEN account_code = "PL201060_01" THEN "Non-Performance Deals"
+        WHEN account_code = "PL201011_01" THEN "Returns Allowances & Cash Disccount"
+        WHEN account_code in ( "PL202070_32_01","PL202070_33_01") THEN "Trade Incentives Performance"
+        WHEN account_code = "PLV959999" THEN "Volume"
+      END AS FIT_BW_ACCOUNT
+      ,date
+      ,SUBSTRING(UPPER(SKU),5,100) LA_PRODUCT
+      ,SUM( IF( account_code IN ('PLV959999', 'PL201010_01'), VALUE, VALUE * -1)) FIT_AMOUNT
+  FROM
+    `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.fit_Data`
+  WHERE --account_code IN ('PL201010_01', 'PL202069_01', 'PL201060_01', 'PL201011_01', 'PL202070_32_01', 'PL202070_33_01', 'PLV959999')
+    ENTITY IN ('CDBOLFS', 'CLLFS', 'CDCOLCOM', 'ECLFS', 'PELFS')
+    AND date >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR), YEAR)
+    AND SCENARIO = "Act"
+    AND CURRENCY = "LCL"
+  GROUP BY ALL
+  HAVING FIT_AMOUNT != 0
+)
+
+, CPNL_WACAM_SKU_LEVEL AS (
+  SELECT
+    COUNTRY
+    ,CASE 
+      WHEN ACCOUNT_LVL_3 IN ('Sales Returns','Sales Allowances') THEN "Returns Allowances & Cash Disccount"
+      WHEN ACCOUNT_LVL_3 IN ('Trade Incentives WO APAS', 'APAS') THEN "Trade Incentives Performance"
+      ELSE ACCOUNT_LVL_3
+    END AS FIT_BW_ACCOUNT,
+    -- ACCOUNT_LVL_3,
+    DATE,
+    'SK' || LTRIM(MATERIAL,'0') LA_PRODUCT,
+    SUM(Value_LCL) AMOUNT_LC
+  FROM `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_wacam_cust_pnl_detailed_union` 
+  WHERE COUNTRY NOT IN ('AMERICA EXPORTS', 'COSTA RICA', 'PUERTO RICO')
+    AND ACCOUNT_LVL_3 IN ('Volume', 'Gross Sales', 'Non-Performance Deals', 'Sales Returns', 'Sales Allowances', 'Trade Incentives WO APAS', 'APAS', 'Transportation & Warehousing', 'Variable Cost', 'Write Off')
+    AND date >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR), YEAR)
+  GROUP BY ALL
+  having AMOUNT_LC != 0
+)
+
+/*=== ADJUST FIT VS CPNL ===*/
+
+,ADJUST_FIT_VS_CPNL AS (
+  SELECT 
+    IFNULL(A.COUNTRY, B.COUNTRY) COUNTRY
+    ,IFNULL(A.FIT_BW_ACCOUNT, B.FIT_BW_ACCOUNT) FIT_BW_ACCOUNT
+    ,IFNULL(A.DATE, B.DATE) DATE
+    ,IFNULL(A.LA_PRODUCT, B.LA_PRODUCT) LA_PRODUCT
+    ,COALESCE(B.FIT_AMOUNT,0) - COALESCE(A.AMOUNT_LC,0) AS AMOUNT_LC -- DIFF FIT VS AMOUNT_LC TO ADJUST
+  FROM CPNL_WACAM_SKU_LEVEL A
+  FULL OUTER JOIN FIT_GM_WACAM B
+      ON A.COUNTRY = B.COUNTRY
+      AND A.FIT_BW_ACCOUNT = B.FIT_BW_ACCOUNT
+      AND A.DATE = B.DATE
+      AND A.LA_PRODUCT = B.LA_PRODUCT
+  WHERE ROUND(COALESCE(B.FIT_AMOUNT,0) - COALESCE(A.AMOUNT_LC,0), 4) != 0
+    AND A.DATE <= (SELECT MAX(DATE) MAX_DATE FROM FIT_GM_WACAM)
+)
+
+,ADJUST_FIT_VS_CPNL_INCLUDING_NS_NR_GP AS (
+  SELECT * FROM (
+    SELECT 
+      *
+      ,COALESCE( `Gross Sales`,0) - COALESCE( `Non-Performance Deals`,0) AS `Net Invoice Sales`
+      ,COALESCE( `Gross Sales`,0) - COALESCE( `Non-Performance Deals`,0) - COALESCE( `Returns Allowances & Cash Disccount`,0) -  COALESCE( `Trade Incentives Performance`,0) AS `Net Revenue`
+      ,COALESCE( `Gross Sales`,0) - COALESCE( `Non-Performance Deals`,0) - COALESCE( `Returns Allowances & Cash Disccount`,0) -  COALESCE( `Trade Incentives Performance`,0) -
+      COALESCE( `Transportation & Warehousing`,0) - COALESCE( `Variable Cost`,0) - COALESCE( `Write Off`,0) AS `Gross Profit`
+    FROM ADJUST_FIT_VS_CPNL
+    PIVOT(
+      SUM(AMOUNT_LC)
+      FOR FIT_BW_ACCOUNT IN ('Volume', 'Gross Sales', 'Non-Performance Deals', 'Returns Allowances & Cash Disccount', 'Trade Incentives Performance', 'Transportation & Warehousing', 'Variable Cost', 'Write Off')
+    )
+  )
+  UNPIVOT(
+  VALUE_LCL
+  FOR ACCOUNT_LVL_3 IN (Volume, `Gross Sales`,`Non-Performance Deals`, `Returns Allowances & Cash Disccount`, `Trade Incentives Performance`, `Transportation & Warehousing`, `Variable Cost`, `Write Off`,`Net Revenue`,`Net Invoice Sales`, `Gross Profit`)
+  )
+  WHERE ROUND(VALUE_LCL,4) != 0
+)
+
+/*=== INCLUDE CUSTOMER FIELDS AND RENAME G2N ACCOUNTS ===*/
+
+,INCLUDE_CUST_FIELDS_TO_ADJUST_FIT_VS_CPNL AS (
+
+  SELECT 
+    * EXCEPT (ACCOUNT_LVL_3)
+    ,CASE 
+      WHEN ACCOUNT_LVL_3 = 'Trade Incentives Performance' THEN 'Trade Incentives WO APAS'
+      WHEN ACCOUNT_LVL_3 = 'Returns Allowances & Cash Disccount' THEN 'Sales Returns'
+      ELSE ACCOUNT_LVL_3
+    END AS ACCOUNT_LVL_3
+    ,'ADJUST VS FIT' CUSTOMER
+    ,'ADJUST VS FIT' CUSTOMER_NAME
+    ,'ADJUST VS FIT' CHANNEL
+    ,'ADJUST VS FIT' SUBCHANNEL
+  FROM ADJUST_FIT_VS_CPNL_INCLUDING_NS_NR_GP
+)
+
+/*=== MAPPING TABLES ===*/
+
+, Cluster_mapping AS (
+  SELECT
+    DISTINCT COUNTRY, CLUSTER1, CLUSTER2, CLUSTER3
+  FROM `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.t_wacam_country_hierarchy_mapping`
+)
+
+, ACCOUNT_MAPPING AS (
+  SELECT 'Variable Cost'                   AS ACCOUNT_LVL_3, 'Variable Cost'                   AS ACCOUNT_LVL_2, 'COGS'              AS ACCOUNT_LVL_1 UNION ALL
+  SELECT 'Transportation & Warehousing',  'Transportation & Warehousing',  'COGS'              UNION ALL
+  SELECT 'Write Off',                     'Write Off',                     'COGS'              UNION ALL
+  SELECT 'Gross Profit',                  'Gross Profit',                  'Gross Profit'      UNION ALL
+  SELECT 'Gross Sales',                   'Gross Sales',                   'Gross Sales'       UNION ALL
+  SELECT 'Non-Performance Deals',         'Non-Performance Deals',         'Gross to Net'      UNION ALL
+  SELECT 'APAS',                          'Trade Incentives Manual',       'Gross to Net'      UNION ALL
+  SELECT 'Sales Allowances',             'Commercial Agreements',         'Gross to Net'      UNION ALL
+  SELECT 'Sales Returns',                'Sales Returns',                 'Gross to Net'      UNION ALL
+  SELECT 'Trade Incentives WO APAS',     'Commercial Agreements',         'Gross to Net'      UNION ALL
+  SELECT 'Net Invoice Sales',            'Net Invoice Sales',             'Net Invoice Sales' UNION ALL
+  SELECT 'Net Revenue',                  'Net Revenue',                   'Net Revenue'       UNION ALL
+  SELECT 'Volume',                       'Volume',                        'Volume'
+)
+
+,PRODUCT_MAPPING AS (
+  SELECT
+    `CATEGORY_EX-BISCUITS_DESCRIPTION` CATEGORY
+    ,FORMAT_FLAVOUR_DESCRIPTION FORMAT_FLAVOR -- SHOULD BE FIXED TO FLAVOUR
+    ,L4_DESCRIPTION_IBP BRAND
+    ,`SUB_BRAND-DESCRIPTION`  SUBBRAND_desc
+    ,BRAND_SEGMENT_PRODUCT_DESCRIPTION_BSP BSP
+    ,SKU_CODE MATERIAL
+  FROM `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_fit_product_hier_amer`
+)
+
+/*=== FOREX TABLE ===*/
+
+,FOREX AS (
+    SELECT
+    a.version,
+    -- a.entity AS entity_code,
+    UPPER(d.description) COUNTRY,
+    PARSE_DATE('%Y%m', a.date) AS date,
+    SAFE_DIVIDE(SUM(amount_lc), SUM(amount_rc)) AS amount_rc_fx,
+    SAFE_DIVIDE(SUM(amount_lc), SUM(amount_ac)) AS amount_ac_fx,
+    SAFE_DIVIDE(SUM(amount_lc), SUM(amount_py)) AS amount_py_fx,  
+  FROM `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_sac_rev_model_amer` a
+  LEFT JOIN `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_sac_rev_accounts_amer` b
+    ON a.account = b.member_id
+  LEFT JOIN `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_sac_entity_amer` d
+    ON a.entity = d.member_id
+  WHERE
+    b.level2 in ('NETREV','TOT_COGS','TOT_ADV','TOT_OVHD','TOT_OIE')
+    AND a.Base = '#'
+    AND a.audit_trail IN ('D4GV', 'ADJ', 'INPUT', 'TMP_ADJ', 'TOT_CALC', 'CALC', 'CALC_MR')
+    AND a.UOM = '#'
+    AND a.channel IN ('20', '99')
+    and PARSE_DATE('%Y%m', a.date) >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 3 YEAR), YEAR) 
+    AND LOWER(a.version) IN ('public.actual')
+    AND a.entity IN ('BO', 'CL', 'CO', 'EC', 'PE')
+  GROUP BY 1,2,3
+ 
+)
+
+/*==== JOIN ADJUSTED TABLE WITH MAPPING TABLES ===*/
+
+,FINAL_RECORDS_TO_ADJUST_CPNL_WACAM AS (
+  SELECT 
+    A.* EXCEPT(COUNTRY, ACCOUNT_LVL_3, LA_PRODUCT)
+    ,B.* 
+    ,C.* 
+    ,D.* EXCEPT(MATERIAL)
+    ,LTRIM(D.MATERIAL, 'SK') MATERIAL
+    , '' AREAMANAGER
+    ,'' COMP_CODE
+    , FORMAT_DATE('%Y0%m',a.DATE) FISCPER
+    ,SAFE_DIVIDE(VALUE_LCL, E.amount_rc_fx) Value_USD
+    ,SAFE_DIVIDE(VALUE_LCL, E.amount_ac_fx) Value_AC_Rate
+    ,SAFE_DIVIDE(VALUE_LCL, E.amount_py_fx) Value_PY_Rate
+  FROM INCLUDE_CUST_FIELDS_TO_ADJUST_FIT_VS_CPNL A
+  LEFT JOIN CLUSTER_MAPPING B 
+      ON A.COUNTRY = B.COUNTRY
+  LEFT JOIN ACCOUNT_MAPPING C
+      ON A.ACCOUNT_LVL_3 = C.ACCOUNT_LVL_3
+  LEFT JOIN PRODUCT_MAPPING D
+      ON A.LA_PRODUCT = D.MATERIAL
+  LEFT JOIN FOREX E
+      ON A.COUNTRY = E.COUNTRY
+        AND A.DATE = E.DATE
+)
+
+/*=== UNION DETAILED TABLE AND ADJUSTED TABLE VS FIT ===*/
+
+,CONSOLIDATED_TABLE AS (
+  SELECT * FROM `prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_wacam_cust_pnl_detailed_union` 
+    
+    UNION ALL BY NAME
+
+  SELECT * FROM FINAL_RECORDS_TO_ADJUST_CPNL_WACAM 
+)
+
+SELECT * FROM CONSOLIDATED_TABLE
+
+)
+
