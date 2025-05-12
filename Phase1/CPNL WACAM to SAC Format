@@ -1,0 +1,92 @@
+CREATE OR REPLACE VIEW `dev-amer-analyt-actuals-svc-7a.amer_p_la_fin_data_hub.V_CPNL_WACAM_PHASE1_SAC_FORMAT` AS
+
+WITH account_mapping AS (
+  SELECT 'Volume' AS ACCOUNT_LVL_3, 'PL1000' AS SAC_ACCOUNT UNION ALL
+  SELECT 'Gross Sales', 'PL1005' UNION ALL
+  SELECT 'Non-Performance Deals', 'LA203' UNION ALL
+  SELECT 'Sales Returns', 'LA201' UNION ALL
+  SELECT 'Sales Allowances', 'LA202' UNION ALL
+  SELECT 'Trade Incentives WO APAS', 'LA227' UNION ALL
+  SELECT 'APAS', 'LA228'
+)
+
+, entity_mapping AS (
+  SELECT 'BOLIVIA' AS COUNTRY, 'CDBOLFS' AS SAC_ID, '20' AS CHANNEL UNION ALL
+  SELECT 'CHILE', 'CLLFS', '20' UNION ALL
+  SELECT 'COLOMBIA', 'CDCOLOM2', '20' UNION ALL
+  SELECT 'ECUADOR', 'ECLFS', '20' UNION ALL
+  SELECT 'PERU', 'PELFS', '20'
+)
+
+, CUSTOMER_MAPPING AS (
+  SELECT
+  DISTINCT
+    customer_cd_nk
+    ,sales_cust_hier_l2_cd
+  FROM `dev-amer-analyt-actuals-svc-7a.amer_p_la_fin_data_hub.t_dim_customer_salesarea_flattened_hierarchies_prd`
+  where hierarchy_type_cd_nk ='A'
+)
+
+/*=== Filter only NR accounts from CP&L. Also apply Column Transformations -> LA_PRODUCT & DATE ===*/
+
+,CUSTOMER_PNL_WACAM AS (
+  SELECT  
+    ACCOUNT_LVL_3,
+    COUNTRY,
+    'LA_SK' || LTRIM(MATERIAL,'0') LA_PRODUCT,
+    CUSTOMER,
+    FORMAT_DATE('%Y%m',DATE) DATE,
+    SUM(Value_LCL) AMOUNT_LC
+  FROM `dev-amer-analyt-actuals-svc-7a.amer_p_la_fin_data_hub.V_CPNL_WACAM_PHASE1_ADJUST_VS_FIT`--`prd-amer-analyt-actuals-svc-0a.amer_p_la_fin_data_hub.v_wacam_cust_pnl_detailed_union` --
+  WHERE COUNTRY NOT IN ('AMERICA EXPORTS', 'COSTA RICA', 'PUERTO RICO')
+    AND ACCOUNT_LVL_3 IN ('Volume', 'Gross Sales', 'Non-Performance Deals', 'Sales Returns', 'Sales Allowances', 'Trade Incentives WO APAS', 'APAS')
+  GROUP BY ALL
+  having AMOUNT_LC != 0
+)
+
+/*=== Replace Customer field. From Sold to --> Cust Lvl2 ===*/
+
+,CUSTOMER_PNL_WACAM_W_CUSTOMER_LVL2 AS (
+  SELECT 
+    A.ACCOUNT_LVL_3
+    ,A.COUNTRY
+    ,A.LA_PRODUCT
+    ,D.SALES_CUST_HIER_L2_CD AS LA_CUSTOMER
+    ,A.DATE
+    ,SUM(A.AMOUNT_LC) AMOUNT_LC
+  FROM CUSTOMER_PNL_WACAM A
+  LEFT JOIN CUSTOMER_MAPPING D
+      ON A.CUSTOMER = D.CUSTOMER_CD_NK
+  GROUP BY 1,2,3,4,5
+)
+
+/*=== Replace Account and Entity from Customer P&L to match with SAC codes based on mapping Tables. Also include channel based on entity_mapping ===*/
+
+,CUSTOMER_PNL_WACAM_W_ACCOUNT_ENTITY_CHANNEL_FROM_SAC AS (
+  SELECT 
+    B.SAC_ACCOUNT AS ACCOUNT
+    ,C.SAC_ID AS LA_ENTITY
+    ,A.LA_PRODUCT
+    ,LA_CUSTOMER
+    ,A.DATE
+    ,C.CHANNEL
+    ,SUM(A.AMOUNT_LC) AMOUNT_LC
+  FROM CUSTOMER_PNL_WACAM_W_CUSTOMER_LVL2 A
+  LEFT JOIN ACCOUNT_MAPPING B
+      ON A.ACCOUNT_LVL_3 = B.ACCOUNT_LVL_3
+  LEFT JOIN ENTITY_MAPPING C
+      ON A.COUNTRY = C.COUNTRY
+  GROUP BY 1,2,3,4,5,6
+)
+
+/*=== Include AUDIT_TRAIL, CHANNEL, BASE, VERSION AND UOM based on Transformation Rules ===*/
+
+SELECT 
+  * EXCEPT(CHANNEL, AMOUNT_LC)
+  ,'D4GV' AUDIT_TRAIL
+  ,CHANNEL
+  , '#' BASE
+  ,'public.Actual' VERSION
+  ,IF(ACCOUNT = 'PL1000', 'KG', '#') UOM
+  ,AMOUNT_LC
+FROM CUSTOMER_PNL_WACAM_W_ACCOUNT_ENTITY_CHANNEL_FROM_SAC
